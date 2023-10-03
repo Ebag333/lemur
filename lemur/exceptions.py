@@ -63,3 +63,21 @@ class InvalidAuthority(Exception):
 
 class UnknownProvider(Exception):
     pass
+
+
+class IssuerPaymentRequired(LemurException):
+    """
+    Raised when there are not enough funds to make an order with a paid certificate issuer.
+
+    402 Payment Required https://tools.ietf.org/html/rfc7231#section-6.5.2
+
+    :param message: the error message provided for insufficient funds.
+    """
+    code = 402
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__()
+
+    def __str__(self):
+        return f"{self.code}: Issuer Payment Required. {self.message}"

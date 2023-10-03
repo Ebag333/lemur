@@ -13,10 +13,13 @@
 
 .. moduleauthor:: Kevin Glisson <kglisson@netflix.com>
 """
+from __future__ import annotations  # Import annotations to make type hints backwards compatible with Python 3.7/3.8
+
 import copy
+from dataclasses import dataclass
 import ipaddress
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Union
 
 import arrow
 import pem
@@ -25,6 +28,7 @@ import sys
 from cryptography import x509
 from flask import current_app, g
 from lemur.common.utils import validate_conf, convert_pkcs7_bytes_to_pem
+from lemur.exceptions import InvalidConfiguration, IssuerPaymentRequired
 from lemur.extensions import metrics
 from lemur.plugins import lemur_digicert as digicert
 from lemur.plugins.bases import IssuerPlugin, SourcePlugin
@@ -283,6 +287,30 @@ def get_cis_certificate(session, base_url, order_id):
     return cert_chain_pem
 
 
+@dataclass
+class CertPriceDetails:
+    product_type: str
+    price_estimate: float
+    remaining_funds: float
+    balance_minimum: float = current_app.config.get("DIGICERT_BALANCE_MINIMUM", 0)
+
+    def format_remaining_funds(self):
+        return f"${self.remaining_funds:,.2f}"
+
+    def format_price_estimate(self):
+        return f"${self.price_estimate:,.2f}"
+
+    def has_sufficient_funds(self):
+        return self.remaining_funds >= self.balance_minimum
+
+    def as_dict(self):
+        d = self.__dict__.copy()
+        d['price_estimate'] = self.format_price_estimate()
+        d['has_sufficient_funds'] = self.has_sufficient_funds()
+        d['remaining_funds'] = self.format_remaining_funds()
+        return d
+
+
 class DigiCertSourcePlugin(SourcePlugin):
     """Wrap the Digicert Certifcate API."""
 
@@ -371,6 +399,11 @@ class DigiCertIssuerPlugin(IssuerPlugin):
         """
         base_url = current_app.config.get("DIGICERT_URL")
         cert_type = current_app.config.get("DIGICERT_ORDER_TYPE")
+
+        # Get certificate pricing
+        certificate_price_details = self.get_digicert_pricing(issuer_options)
+        if not certificate_price_details.has_sufficient_funds() and current_app.config.get("DIGICERT_BALANCE_MINIMUM", 0) > 0:
+            raise IssuerPaymentRequired(f"There are insufficient DigiCert funds to complete this order. Estimated remaining funds if order is placed: {certificate_price_details.format_remaining_funds()}")
 
         # make certificate request
         determinator_url = "{0}/services/v2/order/certificate/{1}".format(
@@ -461,6 +494,106 @@ class DigiCertIssuerPlugin(IssuerPlugin):
             raise Exception(
                 "Failed to cancel pending certificate {0}".format(pending_cert.name)
             )
+
+    def get_digicert_pricing(
+            self,
+            issuer_options: dict,
+            validity_years: int = 1
+    ) -> CertPriceDetails:
+        """
+        Get the estimated price for the requested certificate options and product type.
+
+        :param issuer_options: Dictionary containing issuer options.
+        :param validity_years: Validity of the certificate in years. Defaults to 1 year.
+        :return: Estimated price for the requested certificate options and product type.
+        """
+
+        base_url = current_app.config.get("DIGICERT_URL")
+
+        product_type = self.build_product_type(issuer_options)
+
+        if not product_type:
+            current_app.logger.warning(
+                f"Failed to determine DigiCert product type from issuer options: {issuer_options}")
+            return CertPriceDetails(
+                product_type="Failed to determine DigiCert product type",
+                price_estimate=0,
+            )
+
+        url = f"{base_url}/services/v2/finance/order-pricing"
+
+        dns_names = get_additional_names(issuer_options)
+        payload = {
+            'certificate': {
+                'dns_names': dns_names
+            },
+            'validity_years': current_app.config.get("DIGICERT_DEFAULT_VALIDITY", validity_years),
+            'product_name_id': product_type
+        }
+
+        response = self.session.post(url, json=payload)
+
+        if response.status_code > 399:
+            raise Exception(response.json())
+        price_estimate = response.json()['total_price']
+
+        # Get the current account balance
+        account_balance_response = self.session.get(base_url + "/services/v2/finance/balance")
+        if account_balance_response.status_code > 399:
+            raise Exception(account_balance_response.json()["errors"][0]["message"])
+        account_balance = account_balance_response.json()
+
+        return CertPriceDetails(
+            product_type=product_type.replace("_", " ").title(),
+            price_estimate=price_estimate,
+            remaining_funds=account_balance
+        )
+
+    @staticmethod
+    def build_product_type(issuer_options: dict) -> Optional[str]:
+        """
+        Determines the most relevant DigiCert product type based on the provided issuer options.
+        Available product types include:
+        {'ssl_multi_domain', 'ssl_securesite_multi_domain', 'ssl_plus', 'ssl_wildcard', 'ssl_securesite_wildcard'}.
+
+        The 'securesite' is DigiCert's product code for a certificate that comes with extra/priority business support.
+
+        :param issuer_options: Dictionary containing issuer options.
+        :return: A string indicating the product type, or None if no match is found.
+        """
+
+        def determine_product_type(helper_cn: str, helper_dns_names: list[str]) -> Optional[str]:
+            """
+            Determines the appropriate product type based on the given common name (helper_cn) and DNS names (helper_dns_names).
+
+            :param helper_cn: The common name to evaluate.
+            :param helper_dns_names: The list of DNS names associated with the certificate.
+            :return: A string indicating the product type, or None if no match is found.
+            """
+            # Mapping of conditions to product types
+            product_conditions = {
+                (lambda: helper_cn.startswith("*."),): "ssl_wildcard",
+                (lambda: len(helper_dns_names) == 1,): "ssl_plus",
+                (lambda: len(helper_dns_names) == 2 and helper_cn.replace("www.", "") in helper_dns_names,): "ssl_plus",
+                (lambda: len(helper_dns_names) >= 2,): "ssl_multi_domain"
+            }
+
+            # Iterating through the conditions and returning the matching product type
+            for conditions, product_type in product_conditions.items():
+                if all(cond() for cond in conditions):
+                    return product_type
+
+            return None
+
+        if not issuer_options:
+            raise InvalidConfiguration(f"No DigiCert product name found for {issuer_options}")
+
+        order_type = current_app.config.get("DIGICERT_PRODUCT_TYPE_MAPPING_TO_DOMAIN", {}).get(issuer_options["common_name"])
+        if order_type:
+            current_app.logger.debug(f"""Found {order_type} order type config for {issuer_options["common_name"]}.""")
+            return order_type
+
+        return determine_product_type(helper_cn=issuer_options["common_name"], helper_dns_names=get_additional_names(issuer_options))
 
     @staticmethod
     def create_authority(options):
@@ -602,6 +735,8 @@ class DigiCertCISIssuerPlugin(IssuerPlugin):
     def create_certificate(self, csr, issuer_options):
         """Create a DigiCert certificate."""
         base_url = current_app.config.get("DIGICERT_CIS_URL")
+
+        product_type = self.build_product_type(issuer_options)
 
         # make certificate request
         create_url = "{0}/platform/cis/certificate".format(base_url)
